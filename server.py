@@ -10,6 +10,7 @@ image_tools_mcp — 图像处理 MCP 服务
 import json
 import math
 import os
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -378,6 +379,191 @@ async def image_info(params: ImageInfoInput) -> str:
             results.append({"file": str(src.name), "error": str(e)})
 
     return json.dumps({"count": len(results), "images": results}, ensure_ascii=False, indent=2)
+
+
+# ── PDF 水印工具 ────────────────────────────────────────────────────────────────
+
+_PDF_REGISTERED_FONTS: dict[str, str] = {}  # path -> font_name
+
+
+def _register_pdf_font(font_path: Optional[str]) -> str:
+    """注册字体到 reportlab，返回可用的字体名称。"""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    candidates = ([font_path] if font_path else []) + FALLBACK_FONTS
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        if path in _PDF_REGISTERED_FONTS:
+            return _PDF_REGISTERED_FONTS[path]
+        try:
+            name = f"CustomFont_{len(_PDF_REGISTERED_FONTS)}"
+            pdfmetrics.registerFont(TTFont(name, path))
+            _PDF_REGISTERED_FONTS[path] = name
+            return name
+        except Exception:
+            continue
+    return "Helvetica"
+
+
+def _make_pdf_watermark_buf(
+    page_width: float,
+    page_height: float,
+    text: str,
+    angle: float,
+    opacity: float,
+    font_size: int,
+    gap: int,
+    color: tuple,
+    font_name: str,
+) -> BytesIO:
+    """生成与页面等大的透明水印 PDF（in-memory）。"""
+    from reportlab.lib.colors import Color
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    buf = BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(page_width, page_height))
+    r, g, b = color
+    c.setFillColor(Color(r / 255, g / 255, b / 255, alpha=opacity))
+    c.setFont(font_name, font_size)
+
+    tw = stringWidth(text, font_name, font_size)
+    th = font_size
+    step_x = tw + gap
+    step_y = th + gap
+
+    diag = math.ceil(math.sqrt(page_width ** 2 + page_height ** 2))
+    n_x = int(diag / step_x) + 2
+    n_y = int(diag / step_y) + 2
+
+    c.saveState()
+    c.translate(page_width / 2, page_height / 2)
+    c.rotate(angle)
+    for i in range(-n_x, n_x + 1):
+        for j in range(-n_y, n_y + 1):
+            c.drawString(i * step_x, j * step_y, text)
+    c.restoreState()
+    c.save()
+    buf.seek(0)
+    return buf
+
+
+def _collect_pdfs(input_path: str) -> list[Path]:
+    p = Path(input_path)
+    if p.is_file():
+        if p.suffix.lower() != ".pdf":
+            raise ValueError(f"不是 PDF 文件：{p.suffix}，请传入 .pdf 文件或文件夹")
+        return [p]
+    elif p.is_dir():
+        files = [f for f in p.iterdir() if f.suffix.lower() == ".pdf"]
+        if not files:
+            raise ValueError(f"文件夹 {p} 中没有找到 PDF 文件")
+        return sorted(files)
+    else:
+        raise FileNotFoundError(f"路径不存在：{p}")
+
+
+class PDFWatermarkInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    input_path: str = Field(..., description="PDF 文件路径或包含 PDF 的文件夹路径")
+    text: str = Field(..., description="水印文字内容", min_length=1, max_length=100)
+    angle: float = Field(default=30.0, description="倾斜角度，正数=逆时针，默认 30", ge=-180, le=180)
+    opacity: float = Field(default=0.12, description="透明度 0~1，默认 0.12", ge=0.0, le=1.0)
+    font_size: int = Field(default=36, description="字号（点），默认 36", ge=8, le=200)
+    gap: int = Field(default=80, description="水印重复间距（点），默认 80（越大越稀疏）", ge=10, le=500)
+    color: str = Field(default="128,128,128", description="文字颜色 R,G,B，默认灰色 '128,128,128'")
+    suffix: str = Field(default="_wm", description="输出文件名后缀，默认 '_wm'")
+    font_path: Optional[str] = Field(default=None, description="字体文件路径（可选，不填自动检测中文字体）")
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, v: str) -> str:
+        parts = v.split(",")
+        if len(parts) != 3:
+            raise ValueError("color 格式应为 R,G,B，例如 128,128,128")
+        for p in parts:
+            val = int(p.strip())
+            if not 0 <= val <= 255:
+                raise ValueError("颜色值应在 0~255 之间")
+        return v
+
+
+@mcp.tool(
+    name="pdf_add_watermark",
+    annotations={
+        "title": "PDF 批量添加满铺斜向水印",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pdf_add_watermark(params: PDFWatermarkInput) -> str:
+    """为 PDF 文件添加满铺斜向平铺水印，支持单个文件或批量处理整个文件夹。
+
+    水印以指定角度均匀铺满每一页，可调节透明度、字号、间距和颜色。
+    输出为新文件（原文件名+后缀），不覆盖原文件。
+
+    Args:
+        params (PDFWatermarkInput): 水印参数，包含：
+            - input_path: PDF 文件或文件夹路径
+            - text: 水印文字
+            - angle: 倾斜角度（默认30度逆时针）
+            - opacity: 透明度（默认0.12）
+            - font_size: 字号点数（默认36）
+            - gap: 水印间距点数（默认80）
+            - color: R,G,B 颜色字符串（默认灰色）
+            - suffix: 输出文件后缀（默认_wm）
+            - font_path: 可选字体路径
+
+    Returns:
+        str: JSON，包含处理结果列表，每项含 input/output/pages/status/error
+    """
+    from pypdf import PdfReader, PdfWriter
+
+    try:
+        targets = _collect_pdfs(params.input_path)
+    except (ValueError, FileNotFoundError) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    color = tuple(int(x.strip()) for x in params.color.split(","))
+    font_name = _register_pdf_font(params.font_path)
+    results = []
+
+    for src in targets:
+        try:
+            reader = PdfReader(str(src))
+            writer = PdfWriter()
+
+            for page in reader.pages:
+                pw = float(page.mediabox.width)
+                ph = float(page.mediabox.height)
+                wm_buf = _make_pdf_watermark_buf(
+                    pw, ph, params.text, params.angle, params.opacity,
+                    params.font_size, params.gap, color, font_name,
+                )
+                wm_page = PdfReader(wm_buf).pages[0]
+                page.merge_page(wm_page)
+                writer.add_page(page)
+
+            out = src.parent / f"{src.stem}{params.suffix}{src.suffix}"
+            with open(out, "wb") as f:
+                writer.write(f)
+
+            results.append({
+                "input": str(src),
+                "output": str(out),
+                "pages": len(reader.pages),
+                "status": "ok",
+            })
+        except Exception as e:
+            results.append({"input": str(src), "status": "error", "error": str(e)})
+
+    summary = f"处理完成：{sum(1 for r in results if r['status'] == 'ok')}/{len(results)} 个文件成功"
+    return json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2)
 
 
 # ── 启动 ────────────────────────────────────────────────────────────────────────

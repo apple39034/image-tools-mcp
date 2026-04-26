@@ -11,6 +11,7 @@
 | `image_crop` | 图片裁切（坐标框 / 居中裁切两种模式） |
 | `image_adjust_color` | 调色（亮度 / 对比度 / 饱和度 / 锐度） |
 | `pdf_add_watermark` | PDF 满铺斜向平铺水印（支持批量处理整个文件夹） |
+| `docx_add_watermark` | Word 文档（.docx）添加旋转水印（每页背景显示） |
 
 ## 环境要求
 
@@ -113,6 +114,22 @@ claude mcp list
 | `saturation` | `1.0` | 饱和度，0 = 灰度 |
 | `sharpness` | `1.0` | 锐度，>1 更锐利 |
 | `suffix` | `"_adj"` | 输出后缀 |
+
+### `docx_add_watermark`
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `input_path` | 必填 | .docx 文件路径或包含 .docx 的文件夹（不支持 .doc / .docm） |
+| `text` | 必填 | 水印文字 |
+| `angle` | `315` | 旋转角度（VML/DrawingML 顺时针为正，315=左上→右下） |
+| `opacity` | `0.3` | 透明度（0~1）|
+| `font_size` | `72` | 字号（点） |
+| `color` | `"128,128,128"` | 颜色 "R,G,B" |
+| `suffix` | `"_wm"` | 输出文件名后缀 |
+| `font_family` | 自动选择 | CJK 默认 `Microsoft YaHei`，其他默认 `Arial` |
+
+> 实现方式：通过 Word 原生的页眉水印机制注入 `mc:AlternateContent`（同时提供
+> DrawingML 和 VML 两套），Word 自动在每页背景重复显示。Word 2010+、LibreOffice
+> 均能正确渲染。
 
 ### `pdf_add_watermark`
 | 参数 | 默认值 | 说明 |

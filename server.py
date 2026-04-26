@@ -551,6 +551,218 @@ async def pdf_add_watermark(params: PDFWatermarkInput) -> str:
     return json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2)
 
 
+# ── DOCX 水印工具 ───────────────────────────────────────────────────────────────
+
+def _collect_docx(input_path: str) -> list[Path]:
+    p = Path(input_path)
+    if p.is_file():
+        if p.suffix.lower() != ".docx":
+            raise ValueError(f"不是 .docx 文件：{p.suffix}（不支持旧版 .doc）")
+        return [p]
+    elif p.is_dir():
+        files = [f for f in p.iterdir() if f.suffix.lower() == ".docx"]
+        if not files:
+            raise ValueError(f"文件夹 {p} 中没有找到 .docx 文件")
+        return sorted(files)
+    else:
+        raise FileNotFoundError(f"路径不存在：{p}")
+
+
+# Word 水印模板：mc:AlternateContent 同时提供 DrawingML（现代）和 VML（旧版）
+# DrawingML 给 LibreOffice / Word 2010+；VML 兜底给老版本 Word
+_DOCX_WATERMARK_TEMPLATE = """\
+<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+     xmlns:v="urn:schemas-microsoft-com:vml"
+     xmlns:o="urn:schemas-microsoft-com:office:office"
+     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+     xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+     xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <w:r>
+    <w:rPr><w:noProof/></w:rPr>
+    <mc:AlternateContent>
+      <mc:Choice Requires="wps">
+        <w:drawing>
+          <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0"
+                     relativeHeight="{z_index}" behindDoc="1" locked="0"
+                     layoutInCell="1" allowOverlap="1">
+            <wp:simplePos x="0" y="0"/>
+            <wp:positionH relativeFrom="margin"><wp:align>center</wp:align></wp:positionH>
+            <wp:positionV relativeFrom="margin"><wp:align>center</wp:align></wp:positionV>
+            <wp:extent cx="{cx}" cy="{cy}"/>
+            <wp:effectExtent l="0" t="0" r="0" b="0"/>
+            <wp:wrapNone/>
+            <wp:docPr id="{shape_id}" name="WatermarkShape{shape_id}"/>
+            <wp:cNvGraphicFramePr/>
+            <a:graphic>
+              <a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                <wps:wsp>
+                  <wps:cNvSpPr/>
+                  <wps:spPr>
+                    <a:xfrm rot="{rot_60k}">
+                      <a:off x="0" y="0"/>
+                      <a:ext cx="{cx}" cy="{cy}"/>
+                    </a:xfrm>
+                    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                    <a:noFill/>
+                  </wps:spPr>
+                  <wps:txbx>
+                    <w:txbxContent>
+                      <w:p>
+                        <w:pPr><w:jc w:val="center"/></w:pPr>
+                        <w:r>
+                          <w:rPr>
+                            <w:rFonts w:ascii="{font_family}" w:hAnsi="{font_family}" w:eastAsia="{font_family}"/>
+                            <w:color w:val="{color_hex}"/>
+                            <w:sz w:val="{half_pt}"/>
+                            <w:szCs w:val="{half_pt}"/>
+                          </w:rPr>
+                          <w:t>{text}</w:t>
+                        </w:r>
+                      </w:p>
+                    </w:txbxContent>
+                  </wps:txbx>
+                  <wps:bodyPr rot="0" wrap="square" anchor="ctr" anchorCtr="1"/>
+                </wps:wsp>
+              </a:graphicData>
+            </a:graphic>
+          </wp:anchor>
+        </w:drawing>
+      </mc:Choice>
+      <mc:Fallback>
+        <w:pict>
+          <v:shape id="WatermarkShape{shape_id}" o:spid="_x0000_s10{shape_id:02d}"
+                   type="#_x0000_t136"
+                   style="position:absolute;margin-left:0;margin-top:0;width:{width}pt;height:{height}pt;rotation:{angle};z-index:-251655168;mso-position-horizontal:center;mso-position-horizontal-relative:margin;mso-position-vertical:center;mso-position-vertical-relative:margin"
+                   o:allowincell="f" fillcolor="#{color_hex}" stroked="f">
+            <v:fill opacity="{opacity}"/>
+            <v:textpath style="font-family:'{font_family}';font-size:1pt" string="{text}"/>
+          </v:shape>
+        </w:pict>
+      </mc:Fallback>
+    </mc:AlternateContent>
+  </w:r>
+</w:p>"""
+
+
+class DocxWatermarkInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    input_path: str = Field(..., description=".docx 文件路径或包含 .docx 的文件夹")
+    text: str = Field(..., description="水印文字内容", min_length=1, max_length=100)
+    angle: float = Field(default=315.0, description="旋转角度（VML 顺时针为正），默认 315=左上→右下", ge=0, le=360)
+    opacity: float = Field(default=0.3, description="透明度 0~1，默认 0.3", ge=0.0, le=1.0)
+    font_size: int = Field(default=72, description="字号（点），默认 72，影响水印形状大小", ge=12, le=200)
+    color: str = Field(default="128,128,128", description="文字颜色 R,G,B，默认灰色")
+    suffix: str = Field(default="_wm", description="输出文件名后缀，默认 _wm")
+    font_family: Optional[str] = Field(default=None, description="字体名（如 'Microsoft YaHei'），默认按文本自动选择")
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, v: str) -> str:
+        parts = v.split(",")
+        if len(parts) != 3:
+            raise ValueError("color 格式应为 R,G,B")
+        for p in parts:
+            val = int(p.strip())
+            if not 0 <= val <= 255:
+                raise ValueError("颜色值应在 0~255 之间")
+        return v
+
+
+@mcp.tool(
+    name="docx_add_watermark",
+    annotations={
+        "title": "Word 文档批量添加水印",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def docx_add_watermark(params: DocxWatermarkInput) -> str:
+    """为 Word 文档（.docx）添加旋转水印，支持单文件或批量处理整个文件夹。
+
+    水印通过 Word 原生页眉机制实现：在每个 section 的页眉里注入 VML 形状，
+    Word 自动在每页背景上重复显示。仅支持 .docx，不支持旧版 .doc 或 .docm。
+
+    Args:
+        params (DocxWatermarkInput): 水印参数
+
+    Returns:
+        str: JSON，包含每个文件的处理结果（input/output/sections/status）
+    """
+    from docx import Document
+    from lxml import etree
+    from xml.sax.saxutils import escape as xml_escape
+
+    try:
+        targets = _collect_docx(params.input_path)
+    except (ValueError, FileNotFoundError) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    # 颜色 RGB → HEX
+    rgb = tuple(int(x.strip()) for x in params.color.split(","))
+    color_hex = "%02X%02X%02X" % rgb
+
+    # 自动选字体：CJK 文本默认用微软雅黑（Mac/Win 均广泛可用），其他用 Arial
+    has_cjk = _has_cjk(params.text)
+    font_family = params.font_family or ("Microsoft YaHei" if has_cjk else "Arial")
+
+    # 形状尺寸
+    char_factor = 1.2 if has_cjk else 0.7
+    width_pt = max(120.0, params.font_size * len(params.text) * char_factor)
+    height_pt = max(60.0, params.font_size * 1.5)
+
+    # 单位换算：1 pt = 12700 EMU；DrawingML 旋转单位 = 1/60000 度
+    EMU_PER_PT = 12700
+    cx = int(width_pt * EMU_PER_PT)
+    cy = int(height_pt * EMU_PER_PT)
+    # VML rotation 顺时针为正；DrawingML rot 也是顺时针为正，单位 1/60000 度
+    rot_60k = int(params.angle * 60000) % (360 * 60000)
+    half_pt = params.font_size * 2  # w:sz 单位是半点
+
+    results = []
+    for src in targets:
+        try:
+            doc = Document(str(src))
+            section_count = len(doc.sections)
+
+            for idx, section in enumerate(doc.sections, start=1):
+                wm_xml = _DOCX_WATERMARK_TEMPLATE.format(
+                    shape_id=idx,
+                    z_index=251655168 + idx,
+                    width=round(width_pt, 1),
+                    height=round(height_pt, 1),
+                    cx=cx,
+                    cy=cy,
+                    angle=int(params.angle),
+                    rot_60k=rot_60k,
+                    color_hex=color_hex,
+                    opacity=params.opacity,
+                    font_family=xml_escape(font_family),
+                    half_pt=half_pt,
+                    text=xml_escape(params.text),
+                )
+                wm_elem = etree.fromstring(wm_xml)
+                section.header._element.append(wm_elem)
+
+            out = src.parent / f"{src.stem}{params.suffix}{src.suffix}"
+            doc.save(str(out))
+
+            results.append({
+                "input": str(src),
+                "output": str(out),
+                "sections": section_count,
+                "status": "ok",
+            })
+        except Exception as e:
+            results.append({"input": str(src), "status": "error", "error": str(e)})
+
+    summary = f"处理完成：{sum(1 for r in results if r['status'] == 'ok')}/{len(results)} 个文件成功"
+    return json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2)
+
+
 # ── 启动 ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mcp.run()

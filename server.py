@@ -10,7 +10,6 @@ image_tools_mcp — 图像处理 MCP 服务
 import json
 import math
 import os
-from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -383,73 +382,6 @@ async def image_info(params: ImageInfoInput) -> str:
 
 # ── PDF 水印工具 ────────────────────────────────────────────────────────────────
 
-_PDF_REGISTERED_FONTS: dict[str, str] = {}  # path -> font_name
-
-
-def _register_pdf_font(font_path: Optional[str]) -> str:
-    """注册字体到 reportlab，返回可用的字体名称。"""
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-
-    candidates = ([font_path] if font_path else []) + FALLBACK_FONTS
-    for path in candidates:
-        if not path or not os.path.exists(path):
-            continue
-        if path in _PDF_REGISTERED_FONTS:
-            return _PDF_REGISTERED_FONTS[path]
-        try:
-            name = f"CustomFont_{len(_PDF_REGISTERED_FONTS)}"
-            pdfmetrics.registerFont(TTFont(name, path))
-            _PDF_REGISTERED_FONTS[path] = name
-            return name
-        except Exception:
-            continue
-    return "Helvetica"
-
-
-def _make_pdf_watermark_buf(
-    page_width: float,
-    page_height: float,
-    text: str,
-    angle: float,
-    opacity: float,
-    font_size: int,
-    gap: int,
-    color: tuple,
-    font_name: str,
-) -> BytesIO:
-    """生成与页面等大的透明水印 PDF（in-memory）。"""
-    from reportlab.lib.colors import Color
-    from reportlab.pdfbase.pdfmetrics import stringWidth
-    from reportlab.pdfgen import canvas as rl_canvas
-
-    buf = BytesIO()
-    c = rl_canvas.Canvas(buf, pagesize=(page_width, page_height))
-    r, g, b = color
-    c.setFillColor(Color(r / 255, g / 255, b / 255, alpha=opacity))
-    c.setFont(font_name, font_size)
-
-    tw = stringWidth(text, font_name, font_size)
-    th = font_size
-    step_x = tw + gap
-    step_y = th + gap
-
-    diag = math.ceil(math.sqrt(page_width ** 2 + page_height ** 2))
-    n_x = int(diag / step_x) + 2
-    n_y = int(diag / step_y) + 2
-
-    c.saveState()
-    c.translate(page_width / 2, page_height / 2)
-    c.rotate(angle)
-    for i in range(-n_x, n_x + 1):
-        for j in range(-n_y, n_y + 1):
-            c.drawString(i * step_x, j * step_y, text)
-    c.restoreState()
-    c.save()
-    buf.seek(0)
-    return buf
-
-
 def _collect_pdfs(input_path: str) -> list[Path]:
     p = Path(input_path)
     if p.is_file():
@@ -504,14 +436,14 @@ class PDFWatermarkInput(BaseModel):
 async def pdf_add_watermark(params: PDFWatermarkInput) -> str:
     """为 PDF 文件添加满铺斜向平铺水印，支持单个文件或批量处理整个文件夹。
 
-    水印以指定角度均匀铺满每一页，可调节透明度、字号、间距和颜色。
+    使用 PyMuPDF 直接写入页面内容流，正确处理旋转页、扫描件等所有 PDF 结构。
     输出为新文件（原文件名+后缀），不覆盖原文件。
 
     Args:
         params (PDFWatermarkInput): 水印参数，包含：
             - input_path: PDF 文件或文件夹路径
             - text: 水印文字
-            - angle: 倾斜角度（默认30度逆时针）
+            - angle: 倾斜角度（默认30度）
             - opacity: 透明度（默认0.12）
             - font_size: 字号点数（默认36）
             - gap: 水印间距点数（默认80）
@@ -522,41 +454,73 @@ async def pdf_add_watermark(params: PDFWatermarkInput) -> str:
     Returns:
         str: JSON，包含处理结果列表，每项含 input/output/pages/status/error
     """
-    from pypdf import PdfReader, PdfWriter
+    import fitz  # pymupdf
 
     try:
         targets = _collect_pdfs(params.input_path)
     except (ValueError, FileNotFoundError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    color = tuple(int(x.strip()) for x in params.color.split(","))
-    font_name = _register_pdf_font(params.font_path)
-    results = []
+    color_rgb = tuple(int(x.strip()) for x in params.color.split(","))
+    r, g, b = [x / 255.0 for x in color_rgb]
 
+    # 选字体文件（优先用户指定，其次系统中文字体，最后内置）
+    font_candidates = ([params.font_path] if params.font_path else []) + FALLBACK_FONTS
+    fontfile = next((p for p in font_candidates if p and os.path.exists(p)), None)
+
+    # 预计算文字宽度（用于步长）
+    try:
+        fitz_font = fitz.Font(fontfile=fontfile) if fontfile else fitz.Font("helv")
+        tw = fitz_font.text_length(params.text, fontsize=params.font_size)
+    except Exception:
+        fontfile = None
+        fitz_font = fitz.Font("helv")
+        tw = fitz_font.text_length(params.text, fontsize=params.font_size)
+
+    step_x = tw + params.gap
+    step_y = params.font_size + params.gap
+    rad = math.radians(params.angle)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+    results = []
     for src in targets:
         try:
-            reader = PdfReader(str(src))
-            writer = PdfWriter()
+            doc = fitz.open(str(src))
+            page_count = len(doc)
 
-            for page in reader.pages:
-                pw = float(page.mediabox.width)
-                ph = float(page.mediabox.height)
-                wm_buf = _make_pdf_watermark_buf(
-                    pw, ph, params.text, params.angle, params.opacity,
-                    params.font_size, params.gap, color, font_name,
-                )
-                wm_page = PdfReader(wm_buf).pages[0]
-                page.merge_page(wm_page)
-                writer.add_page(page)
+            for page in doc:
+                # page.rect 已自动处理 /Rotate，始终是显示坐标系
+                pw, ph = page.rect.width, page.rect.height
+                cx, cy = pw / 2, ph / 2
+                diag = math.ceil(math.sqrt(pw ** 2 + ph ** 2))
+                n_x = int(diag / step_x) + 2
+                n_y = int(diag / step_y) + 2
+
+                rot_mat = fitz.Matrix(params.angle)
+                for i in range(-n_x, n_x + 1):
+                    for j in range(-n_y, n_y + 1):
+                        gx, gy = i * step_x, j * step_y
+                        x = cx + gx * cos_a - gy * sin_a
+                        y = cy + gx * sin_a + gy * cos_a
+                        pt = fitz.Point(x, y)
+                        page.insert_text(
+                            pt,
+                            params.text,
+                            fontsize=params.font_size,
+                            fontfile=fontfile,
+                            color=(r, g, b),
+                            morph=(pt, rot_mat),
+                            fill_opacity=params.opacity,
+                        )
 
             out = src.parent / f"{src.stem}{params.suffix}{src.suffix}"
-            with open(out, "wb") as f:
-                writer.write(f)
+            doc.save(str(out), garbage=4, deflate=True)
+            doc.close()
 
             results.append({
                 "input": str(src),
                 "output": str(out),
-                "pages": len(reader.pages),
+                "pages": page_count,
                 "status": "ok",
             })
         except Exception as e:

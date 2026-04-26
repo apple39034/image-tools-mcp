@@ -31,6 +31,16 @@ bash install.sh
 
 安装完成后重启 Claude Code，`/mcp` 即可看到 `image-tools ✓ Connected`。
 
+## 升级到最新版本
+
+```bash
+cd ~/tools/image-tools-mcp
+bash update.sh
+```
+
+或手动：`git pull && uv sync`。MCP 注册路径不变，无需重新执行 `claude mcp add`。
+更新后在 Claude Code 中执行 `/mcp` 重连 `image-tools`，或重启 Claude Code。
+
 ## 手动安装
 
 ### 步骤 1：安装依赖

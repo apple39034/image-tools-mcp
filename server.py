@@ -382,6 +382,63 @@ async def image_info(params: ImageInfoInput) -> str:
 
 # ── PDF 水印工具 ────────────────────────────────────────────────────────────────
 
+def _has_cjk(text: str) -> bool:
+    return any(0x4E00 <= ord(c) <= 0x9FFF or 0x3000 <= ord(c) <= 0x303F for c in text)
+
+
+# 进程级 CJK 字体临时文件（只写一次，整个服务生命周期复用）
+_CJK_FONT_TMPFILE: Optional[str] = None
+
+
+def _get_cjk_fontfile() -> str:
+    """
+    将 PyMuPDF 内置 CJK 字体（DroidSansFallback）写到临时文件并返回路径。
+    进程内只写一次，不依赖任何系统字体。
+    """
+    global _CJK_FONT_TMPFILE
+    if _CJK_FONT_TMPFILE and os.path.exists(_CJK_FONT_TMPFILE):
+        return _CJK_FONT_TMPFILE
+
+    import atexit, fitz, tempfile
+    buf = fitz.Font(ordering=1).buffer
+    fd, path = tempfile.mkstemp(suffix=".ttf", prefix="image-tools-cjk-")
+    with os.fdopen(fd, "wb") as f:
+        f.write(buf)
+    atexit.register(lambda p=path: os.path.exists(p) and os.unlink(p))
+    _CJK_FONT_TMPFILE = path
+    return path
+
+
+def _pick_pdf_font(font_path: Optional[str], text: str):
+    """
+    返回 (fitz_font, font_kwargs)，font_kwargs 直接 **解包 传入 insert_text。
+
+    策略（跨机器通用，不依赖系统字体）：
+      1. 用户显式提供 font_path → 验证字形后使用
+      2. 文本含 CJK            → PyMuPDF 内置 CJK（写临时文件，任何机器可用）
+      3. 纯 Latin              → 内置 Helvetica
+    """
+    import fitz
+
+    # 1. 用户指定字体
+    if font_path and os.path.exists(font_path):
+        try:
+            f = fitz.Font(fontfile=font_path)
+            if all(f.has_glyph(ord(c)) for c in text if not c.isspace()):
+                return f, {"fontfile": font_path}
+        except Exception:
+            pass
+
+    # 2. CJK 文本：内置字体，零系统依赖
+    if _has_cjk(text):
+        cjk_path = _get_cjk_fontfile()
+        cjk_font = fitz.Font(fontfile=cjk_path)
+        return cjk_font, {"fontfile": cjk_path}
+
+    # 3. 纯 Latin
+    return fitz.Font("helv"), {"fontname": "helv"}
+
+
 def _collect_pdfs(input_path: str) -> list[Path]:
     p = Path(input_path)
     if p.is_file():
@@ -464,18 +521,9 @@ async def pdf_add_watermark(params: PDFWatermarkInput) -> str:
     color_rgb = tuple(int(x.strip()) for x in params.color.split(","))
     r, g, b = [x / 255.0 for x in color_rgb]
 
-    # 选字体文件（优先用户指定，其次系统中文字体，最后内置）
-    font_candidates = ([params.font_path] if params.font_path else []) + FALLBACK_FONTS
-    fontfile = next((p for p in font_candidates if p and os.path.exists(p)), None)
-
-    # 预计算文字宽度（用于步长）
-    try:
-        fitz_font = fitz.Font(fontfile=fontfile) if fontfile else fitz.Font("helv")
-        tw = fitz_font.text_length(params.text, fontsize=params.font_size)
-    except Exception:
-        fontfile = None
-        fitz_font = fitz.Font("helv")
-        tw = fitz_font.text_length(params.text, fontsize=params.font_size)
+    # 字体选择（跨机器通用：CJK 优先用 PyMuPDF 内置，不依赖系统字体）
+    fitz_font, font_kwargs = _pick_pdf_font(params.font_path, params.text)
+    tw = fitz_font.text_length(params.text, fontsize=params.font_size)
 
     step_x = tw + params.gap
     step_y = params.font_size + params.gap
@@ -507,10 +555,10 @@ async def pdf_add_watermark(params: PDFWatermarkInput) -> str:
                             pt,
                             params.text,
                             fontsize=params.font_size,
-                            fontfile=fontfile,
                             color=(r, g, b),
                             morph=(pt, rot_mat),
                             fill_opacity=params.opacity,
+                            **font_kwargs,
                         )
 
             out = src.parent / f"{src.stem}{params.suffix}{src.suffix}"

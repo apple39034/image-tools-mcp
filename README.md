@@ -12,6 +12,7 @@
 | `image_adjust_color` | 调色（亮度 / 对比度 / 饱和度 / 锐度） |
 | `pdf_add_watermark` | PDF 满铺斜向平铺水印（支持批量处理整个文件夹） |
 | `docx_add_watermark` | Word 文档（.docx）添加旋转水印（每页背景显示） |
+| `xlsx_encrypt` | Excel 文件（.xlsx / .xls）批量加密（设置打开密码） |
 
 ## 环境要求
 
@@ -124,6 +125,20 @@ claude mcp list
 | `saturation` | `1.0` | 饱和度，0 = 灰度 |
 | `sharpness` | `1.0` | 锐度，>1 更锐利 |
 | `suffix` | `"_adj"` | 输出后缀 |
+
+### `xlsx_encrypt`
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `input_path` | 必填 | .xlsx / .xls 文件路径或文件夹 |
+| `password` | 必填 | 打开文件时需要输入的密码 |
+| `suffix` | `"_encrypted"` | 输出文件名后缀 |
+
+**隐私设计**：工具以字节流方式整体读取并加密文件，**不解析工作表内容**。返回值
+仅含 `input` / `output` / `size_kb` / `status`，不含密码、工作表名或单元格值。
+大模型不会、也无法通过此工具读取 Excel 内容。
+
+> 唯一会经过模型上下文的敏感信息是密码本身（你在对话里输入它）。如不希望密码进入
+> 模型，可改用 Python 脚本直接调用 `msoffcrypto-tool`。
 
 ### `docx_add_watermark`
 | 参数 | 默认值 | 说明 |

@@ -763,6 +763,94 @@ async def docx_add_watermark(params: DocxWatermarkInput) -> str:
     return json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2)
 
 
+# ── Excel 加密工具 ──────────────────────────────────────────────────────────────
+
+def _collect_excel(input_path: str) -> list[Path]:
+    p = Path(input_path)
+    exts = {".xlsx", ".xls"}
+    if p.is_file():
+        if p.suffix.lower() not in exts:
+            raise ValueError(f"不支持的格式：{p.suffix}（仅支持 .xlsx / .xls）")
+        return [p]
+    elif p.is_dir():
+        files = [f for f in p.iterdir() if f.suffix.lower() in exts]
+        if not files:
+            raise ValueError(f"文件夹 {p} 中没有找到 .xlsx / .xls 文件")
+        return sorted(files)
+    else:
+        raise FileNotFoundError(f"路径不存在：{p}")
+
+
+class ExcelEncryptInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    input_path: str = Field(..., description=".xlsx / .xls 文件路径或包含这些文件的文件夹")
+    password: str = Field(..., description="打开文件时需要输入的密码", min_length=1, max_length=255)
+    suffix: str = Field(default="_encrypted", description="输出文件名后缀，默认 _encrypted")
+
+
+@mcp.tool(
+    name="xlsx_encrypt",
+    annotations={
+        "title": "Excel 文件批量加密（设置打开密码）",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def xlsx_encrypt(params: ExcelEncryptInput) -> str:
+    """为 Excel 文件（.xlsx / .xls）批量设置打开密码，输出新文件。
+
+    实现仅以字节流方式读取与加密整个文件，不解析工作表内容；返回值只包含
+    文件路径、大小与状态，不含任何单元格信息或工作表名。
+
+    Args:
+        params (ExcelEncryptInput): 加密参数，包含：
+            - input_path: 文件或文件夹
+            - password: 打开密码
+            - suffix: 输出后缀，默认 _encrypted
+
+    Returns:
+        str: JSON，每个文件含 input/output/size_kb/status/error，**不返回密码或表格内容**
+    """
+    import msoffcrypto
+
+    try:
+        targets = _collect_excel(params.input_path)
+    except (ValueError, FileNotFoundError) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    results = []
+    for src in targets:
+        out = src.parent / f"{src.stem}{params.suffix}{src.suffix}"
+        try:
+            with open(src, "rb") as f_in:
+                office = msoffcrypto.OfficeFile(f_in)
+                if office.is_encrypted():
+                    raise ValueError("文件已经加密，请勿重复加密")
+                with open(out, "wb") as f_out:
+                    office.encrypt(params.password, f_out)
+
+            results.append({
+                "input": str(src),
+                "output": str(out),
+                "size_kb": round(out.stat().st_size / 1024, 1),
+                "status": "ok",
+            })
+        except Exception as e:
+            # 加密中途失败，删除可能的部分输出
+            if out.exists():
+                try:
+                    out.unlink()
+                except Exception:
+                    pass
+            results.append({"input": str(src), "status": "error", "error": str(e)})
+
+    summary = f"加密完成：{sum(1 for r in results if r['status'] == 'ok')}/{len(results)} 个文件成功"
+    return json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2)
+
+
 # ── 启动 ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mcp.run()
